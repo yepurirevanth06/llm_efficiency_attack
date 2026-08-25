@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+src/llm_efficiency_attack/__init__.py
+src/llm_efficiency_attack/adapters.py
+src/llm_efficiency_attack/attacker.py
+src/llm_efficiency_attack/config.py
+src/llm_efficiency_attack/metrics.py
+src/llm_efficiency_attack/objective.py
+src/llm_efficiency_attack.egg-info/PKG-INFO
+src/llm_efficiency_attack.egg-info/SOURCES.txt
+src/llm_efficiency_attack.egg-info/dependency_links.txt
+src/llm_efficiency_attack.egg-info/requires.txt
+src/llm_efficiency_attack.egg-info/top_level.txt
+tests/test_attacker_end_to_end.py
+tests/test_config.py
+tests/test_metrics.py
+tests/test_seq2seq_adapter.py

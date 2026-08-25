@@ -1,0 +1,262 @@
+Metadata-Version: 2.4
+Name: llm-efficiency-attack
+Version: 0.1.0
+Summary: General-purpose white-box efficiency (sponge) attack toolbox for Hugging Face LLMs
+License: MIT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: torch<3.0,>=2.1
+Requires-Dist: transformers<5.0,>=4.40
+Requires-Dist: numpy<2.0,>=1.24
+Requires-Dist: sentencepiece<0.3,>=0.1.99
+Provides-Extra: dev
+Requires-Dist: pytest<9.0,>=7.4; extra == "dev"
+
+# llm_efficiency_attack
+
+A general-purpose, white-box **efficiency (sponge) attack** toolbox for
+Hugging Face language models. Given a benign text input, it searches for a
+small, budget-constrained perturbation that makes the model generate
+noticeably more output tokens for the same input length — inflating
+latency and cost without changing what the input "looks like."
+
+This is a refactor/generalization of **NMTSloth** ([FSE 2022](https://dl.acm.org/doi/10.1145/3540250.3549102),
+reference codebase: [SeekingDream/FSE22_NMTSloth](https://github.com/SeekingDream/FSE22_NMTSloth)),
+originally built for a single NMT architecture, generalized here to work
+with any `AutoModelForCausalLM` or `AutoModelForSeq2SeqLM` from Hugging
+Face.
+
+## Install
+
+```bash
+git clone <this repo>
+cd llm_efficiency_attack
+pip install -e .
+```
+
+## Usage
+
+```python
+from transformers import AutoModelForSeq2SeqLM
+from llm_efficiency_attack import Attacker
+
+model = AutoModelForSeq2SeqLM.from_pretrained("Helsinki-NLP/opus-mt-en-de")
+
+x = "The weather today is sunny and warm, and I plan to go for a walk in the park this afternoon."
+config = {
+    "max_perturbed_tokens": 3,
+    "num_candidates": 30,
+    "max_iterations": 6,
+    "objective": "neg_eos_logprob",
+    "objective_horizon": 10,
+    "max_new_tokens": 64,
+    "seed": 0,
+    "device": "cpu",
+}
+
+attack = Attacker(model)
+adv_x, logs = attack.run(x, config)
+
+print(adv_x)
+print(logs["clean_generated_tokens"], "->", logs["adv_generated_tokens"])
+```
+
+Run the same thing as a script:
+
+```bash
+python examples/quickstart.py
+```
+
+**Why a translation model for the demo, not a causal LM?** Open-ended
+causal LMs (GPT-2 style) don't have a well-defined "done" point for
+arbitrary prompts, so a clean input often runs to `max_new_tokens`
+regardless of whether it's under attack -- there's no natural early
+stopping for the attack to suppress. Translation has a well-defined
+completion point, so a clean input terminates quickly and the attack has
+real room to show a length increase. This is also why the NMTSloth paper
+itself evaluated exclusively on NMT systems (`Helsinki-NLP/opus-mt-en-de`
+is literally one of their three eval targets) rather than open-ended
+causal LMs. The `Attacker` API works identically on both model families --
+this is purely about which model makes for a convincing demo.
+
+`Attacker(model)` auto-loads a matching tokenizer via `AutoTokenizer.from_pretrained(model.config._name_or_path)`.
+If you're using a model that has no Hub path (e.g. a hand-built model in a
+test), pass the tokenizer explicitly: `Attacker(model, tokenizer=tokenizer)`.
+
+## How the attack works
+
+Autoregressive decoding is a loop: the model keeps producing tokens until
+it emits an end-of-sequence (EOS) token or hits a length cap. NMTSloth's
+core insight — validated in the paper via a 1,455-NMT-system empirical
+study — is that **output length, not input length, determines compute
+cost**, and output length is gated by two things: a large, rarely-hit
+`max_length` threshold, and a runtime-generated EOS token. So an input that
+suppresses EOS probability forces the model toward the expensive threshold
+instead of stopping naturally.
+
+The paper's method has three stages (Fig. 4): find critical tokens, mutate
+the input, detect degradation. This package reimplements that structure
+generically for any Hugging Face model, but **with several deliberate
+deviations from the paper's exact method** — documented precisely below,
+since "read the paper and codebase first" means being honest about where
+this diverges, not just where it matches.
+
+### Faithful to the paper
+
+- The central hypothesis: suppressing EOS probability delays termination
+  and inflates decode steps (their I-Loops metric, Eq. 4) — this package's
+  `clean_generated_tokens` / `adv_generated_tokens` comparison is exactly
+  that metric.
+- The three-stage structure: gradient-based critical-token identification
+  → candidate-based mutation → real-generation-based degradation check.
+- An iterative, one-token-per-round search under an explicit perturbation
+  budget (`max_perturbed_tokens` ≈ their ε ∈ {1,2,3}).
+- **Token importance score** (Eq. 2): `g_i = Σ_j ∂f(x)/∂tk_i^j` — a
+  *signed* sum of the objective's partial derivatives per token, matching
+  the paper exactly (`Attacker._token_importance_scores`). Positions are
+  ranked by `|g_i|` since the sign alone doesn't determine the swap
+  direction — that's resolved by a real forward-pass evaluation per
+  candidate in `_best_swap_at_position`. (This was originally implemented
+  as an unsigned L2 gradient norm, which couldn't distinguish direction;
+  fixed to match the paper's formula.)
+
+### Deliberate deviations (and why)
+
+| Paper (Sec. 5.2) | This package | Rationale |
+|---|---|---|
+| Objective `f(x) = (1/n)Σ(p_eos_i + p_oi_i)` — averaged over the model's **actual generation length** `n`, minimizing both EOS probability *and* the model's confidence in its own greedy pick | `-log P(EOS)` summed over a fixed, short `objective_horizon` (default 8) | Backpropagating through a full, dynamically-long generation trajectory for every candidate is expensive and was out of scope for a general-purpose package meant to run on arbitrary models/lengths in a demo timeframe. Dropping the confidence term is a real simplification, not just a runtime one — a follow-up objective could add it back (see `objective.py`'s registry). |
+| Candidate search (Eq. 3): linear-approximation search over the **entire vocabulary** | Cosine-similarity nearest-neighbors (`num_candidates`) with real forward-pass scoring per candidate | Full-vocabulary linear scoring is what makes the paper's version fast; evaluating each candidate with a real forward pass (what this package does) is more accurate per-candidate but restricted to a local neighborhood, so it can miss a good candidate the linear approximation would have found globally. |
+| Three perturbation types: character-level, token-level, **and** structure-level (BERT-based, constituency-tree-preserving) | Token-level only | This is the largest scope cut. Character-level and structure-level perturbation are not implemented. If asked "why," the honest answer is scope/time, not a technical blocker — both could be added as new candidate-generation strategies without touching the search loop. |
+| Evaluates sensitivity to beam search size (`num_beams`, RQ2.3) | Greedy decoding only, no beam search path | Not implemented. The adapter's `generate_length` calls `.generate(do_sample=False)`, which is greedy; beam search would need a `num_beams` config field and a corresponding change to how `eos_logprobs` simulates the decode trajectory. |
+| Hardware-dependent metrics: real CPU/GPU latency and energy via Intel RAPL and Nvidia PyNVML | Token count only | This one I'd defend as a reasonable cut rather than a gap: token count *is* the paper's own hardware-independent I-Loops metric (Eq. 4), and it's the metric the task description explicitly asks for ("output length or estimated FLOPs/latency"). Real energy measurement would tie the package to specific hardware/OS APIs, which conflicts with "general-purpose... any Hugging Face model." |
+| Section 7.2: a runtime SVM mitigation/detector trained on encoder hidden states | Not implemented | Out of scope — Task 2's required API only asks for the attack (`Attacker.run`) and an evaluation utility, not a defense mechanism. |
+
+### Where model-specific logic lives
+
+All architecture-specific code is isolated in `adapters.py` behind the
+`ModelAdapter` interface (`encode`, `decode`, `eos_logprobs`,
+`generate_length`, `embedding_matrix`). `attacker.py`, `objective.py`, and
+`metrics.py` never touch a Hugging Face model or tokenizer directly — they
+only call the adapter. Two adapters ship today:
+
+- `CausalLMAdapter` — decoder-only models (GPT-2 style).
+- `Seq2SeqLMAdapter` — encoder-decoder models (T5/BART style).
+
+`build_adapter(model, tokenizer, device)` picks the right one based on
+`model.config.is_encoder_decoder`. **Supporting a new architecture family
+means adding one adapter subclass here — nothing else in the package
+changes.**
+
+### Where the objective lives
+
+`objective.py` is a small registry (`{"neg_eos_logprob": neg_eos_logprob}`)
+so a new attack objective (e.g. targeting a specific FLOPs estimate instead
+of raw token count) can be added without touching the search loop in
+`attacker.py`.
+
+## Config reference
+
+All hyperparameters are supplied through a single JSON-serializable dict,
+validated by `AttackConfig.from_dict` before the attack runs.
+
+| Field                    | Type  | Default            | Meaning                                                                                   |
+| ------------------------ | ----- | ------------------ | ------------------------------------------------------------------------------------------ |
+| `max_perturbed_tokens`   | int   | `3`                | Perturbation budget: max number of input tokens the attack may change.                    |
+| `num_candidates`         | int   | `20`                | Candidate replacement tokens evaluated per position.                                        |
+| `max_iterations`         | int   | `10`                | Greedy search rounds. Each round applies at most one swap.                                  |
+| `objective`               | str   | `"neg_eos_logprob"` | Which registered objective function drives the search.                                       |
+| `objective_horizon`       | int   | `8`                 | Number of decode steps the objective looks at per candidate evaluation.                    |
+| `max_new_tokens`         | int   | `64`                | Cap used when actually running `.generate(...)` for the before/after cost comparison.       |
+| `seed`                    | int   | `0`                 | Random seed. Same config + inputs -> same result.                                            |
+| `device`                  | str   | `"cpu"`             | Torch device string (`"cpu"` or `"cuda"`).                                                    |
+| `min_cosine_similarity`   | float | `0.0`               | If > 0, discard candidate replacements below this embedding cosine similarity to the original token (keeps substitutions "close" to the original word). |
+
+Unknown fields, wrong types, or out-of-range values raise a `ValueError`
+with a specific message before any model call happens.
+
+## `logs` structure
+
+```python
+{
+    "config": {...},                     # effective config, echoed
+    "num_tokens_perturbed": 2,
+    "perturbed_positions": [1, 4],
+    "iterations": [                       # one entry per search round
+        {"iteration": 0, "position": 4, "objective_before": 1.2,
+         "objective_after": 3.7, "improved": True},
+        ...
+    ],
+    "clean_generated_tokens": 12,
+    "adv_generated_tokens": 31,
+    "length_increase": 19,
+    "length_increase_ratio": 2.58,
+    "wall_clock_seconds": 0.41,
+}
+```
+
+## Evaluation utility
+
+`measure_efficiency_damage(adapter, x, adv_x, max_new_tokens)` (in
+`metrics.py`) is reusable outside the attack loop — e.g. to score
+adversarial examples produced elsewhere:
+
+```python
+from llm_efficiency_attack.adapters import build_adapter
+from llm_efficiency_attack.metrics import measure_efficiency_damage
+
+adapter = build_adapter(model, tokenizer, device="cpu")
+damage = measure_efficiency_damage(adapter, x, adv_x, max_new_tokens=64)
+print(damage.length_increase_ratio)
+```
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest tests/ -v
+```
+
+The suite uses a tiny, randomly-initialized but genuinely-real
+`transformers.GPT2LMHeadModel` paired with a small in-memory word-level
+tokenizer (built with the `tokenizers` library, no network access needed)
+so it runs fast and offline. It covers:
+
+- `test_config.py` — config validation (defaults, overrides, every invalid
+  case raises with a clear message).
+- `test_attacker_end_to_end.py` — the full `Attacker.run` path on a causal
+  LM: returns well-formed `(adv_x, logs)`, respects the perturbation
+  budget, is reproducible under a fixed seed, and validates config before
+  doing any work.
+- `test_seq2seq_adapter.py` — the same end-to-end path on a T5-style
+  encoder-decoder model, confirming `build_adapter` correctly dispatches to
+  `Seq2SeqLMAdapter` and that the encoder/decoder gradient + generation
+  plumbing works, not just the causal-LM path.
+- `test_metrics.py` — the standalone cost-metric helper.
+
+Note: because the fixture model is randomly initialized (not trained), its
+EOS probabilities are close to noise, so the length increase on that
+specific fixture is not necessarily large — the tests check the mechanics
+(budget respected, reproducible, well-formed output), not attack strength.
+`examples/quickstart.py` uses a small real pretrained translation model
+(`Helsinki-NLP/opus-mt-en-de`) where the length effect is meaningful to
+observe by eye, since translation has a well-defined stopping point that
+open-ended text completion does not.
+
+## Known limitations / scope
+
+- **Token-level perturbation only.** The paper's character-level and
+  structure-level perturbation types are not implemented.
+- **No beam search support.** Only greedy decoding is exercised in the
+  search and in evaluation.
+- The gradient-guided search is greedy and single-position-per-round; it
+  is not guaranteed to find the strongest possible perturbation within the
+  budget, only a locally improving one.
+- `eos_logprobs` approximates true multi-step decoding by greedily feeding
+  back the argmax token at each step (rather than the model's actual
+  sampling/beam-search behavior), so the objective is a proxy — the
+  reported `length_increase` from real `.generate(...)` calls is the
+  ground truth.
+- Tested against causal (GPT-2 family) and seq2seq (T5/BART family)
+  architectures on both the gradient path and the real `.generate()` path;
+  models with nonstandard generation loops (e.g. non-autoregressive
+  decoders) may need a new `ModelAdapter` subclass.

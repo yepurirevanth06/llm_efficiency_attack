@@ -1,0 +1,7 @@
+torch<3.0,>=2.1
+transformers<5.0,>=4.40
+numpy<2.0,>=1.24
+sentencepiece<0.3,>=0.1.99
+
+[dev]
+pytest<9.0,>=7.4
